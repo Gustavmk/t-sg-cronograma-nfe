@@ -5,6 +5,8 @@ Automação de envio de cronograma de NF via Microsoft Graph API.
 Uso:
     python send_cronograma.py --csv lista.csv
     python send_cronograma.py --csv lista.csv --assunto "Meu Assunto" --mes 5 --ano 2026
+    python send_cronograma.py --csv lista.csv --dry-run
+    python send_cronograma.py --csv lista.csv --force   # ignora idempotência
 """
 
 import argparse
@@ -16,13 +18,15 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import dns.resolver
 import holidays
 import msal
 import requests
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH   = Path(__file__).parent / "config.json"
+TEMPLATE_PATH = Path(__file__).parent / "email_template.html"
 TOKEN_CACHE_PATH = Path(__file__).parent / ".token_cache.bin"
-LOG_PATH = Path(__file__).parent / "send_log.jsonl"
+LOG_PATH      = Path(__file__).parent / "send_log.jsonl"
 
 MONTHS_PT = {
     1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
@@ -30,7 +34,10 @@ MONTHS_PT = {
     9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
 }
 
-GRAPH_SCOPES = ["https://graph.microsoft.com/Mail.Send", "https://graph.microsoft.com/User.Read"]
+GRAPH_SCOPES = [
+    "https://graph.microsoft.com/Mail.Send",
+    "https://graph.microsoft.com/User.Read",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +81,6 @@ def get_access_token(config: dict) -> str:
             TOKEN_CACHE_PATH.write_text(cache.serialize(), encoding="utf-8")
             return result["access_token"]
 
-    # First auth or token expired — use device code flow
     flow = app.initiate_device_flow(scopes=GRAPH_SCOPES)
     if "user_code" not in flow:
         raise RuntimeError(f"Falha ao iniciar device code flow: {flow}")
@@ -126,11 +132,11 @@ def compute_dates(ref_date: date) -> dict:
     ano_seg = ano + 1 if mes == 12 else ano
     quinto_du = nth_business_day(ano_seg, mes_seg, 5)
     return {
-        "MesAtual": MONTHS_PT[mes],
-        "AnoVigente": str(ano),
-        "MesSeguinte": MONTHS_PT[mes_seg],
+        "MesAtual":       MONTHS_PT[mes],
+        "AnoVigente":     str(ano),
+        "MesSeguinte":    MONTHS_PT[mes_seg],
         "AnoMesSeguinte": str(ano_seg),
-        "QuintoDiaUtil": quinto_du.strftime("%d"),
+        "QuintoDiaUtil":  quinto_du.strftime("%d"),
     }
 
 
@@ -168,64 +174,79 @@ def read_csv(csv_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Email rendering
+# MX validation
 # ---------------------------------------------------------------------------
 
-def render_html(recipient: dict, dates: dict) -> str:
-    d = dates
-    pagamento = f"{d['QuintoDiaUtil']}/{d['MesSeguinte']}/{d['AnoMesSeguinte']}"
-    valor_nf = recipient["ValorNF"]
-    return f"""<!DOCTYPE html>
-<html lang="pt-BR">
-<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:680px;line-height:1.6;">
+def validate_mx(recipients: list[dict]) -> list[dict]:
+    """
+    Check DNS MX records for each unique email domain.
+    Returns list of recipients whose domain has no MX record.
+    Warnings are printed; execution is not aborted.
+    """
+    print("\nValidando registros MX dos domínios de email...")
+    domains_checked: dict[str, bool] = {}
+    invalid: list[dict] = []
 
-<p>Boa tarde,</p>
+    for r in recipients:
+        domain = r["Email"].split("@")[1]
+        if domain not in domains_checked:
+            try:
+                dns.resolver.resolve(domain, "MX", lifetime=5)
+                domains_checked[domain] = True
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer,
+                    dns.resolver.NoNameservers, dns.exception.Timeout):
+                domains_checked[domain] = False
 
-<p>Segue cronograma referente ao mês de <strong>{d['MesAtual']}</strong> de <strong>{d['AnoVigente']}</strong>.</p>
+        if not domains_checked[domain]:
+            print(f"  [AVISO] Domínio sem registro MX: {domain} ({r['Email']})")
+            invalid.append(r)
 
-<p>Valor da NF <strong>{valor_nf}</strong></p>
+    if not invalid:
+        print(f"  Todos os {len(recipients)} domínio(s) validados com sucesso.")
 
-<p>Enviar NF e documentos para <a href="mailto:dp@twygo.com">dp@twygo.com</a></p>
-<ul>
-  <li>Cópia do pró-labore (MEI está isento).</li>
-  <li>Comprovante de pagamento dos tributos (INSS pago) + Certidão Negativa de Débitos Federais</li>
-</ul>
+    return invalid
 
-<table border="1" cellpadding="10" cellspacing="0"
-       style="border-collapse:collapse;width:100%;max-width:520px;border-color:#ccc;">
-  <thead>
-    <tr style="background-color:#f0f0f0;">
-      <th style="text-align:left;">Cronograma Ref. {d['MesAtual']}/{d['AnoVigente']}</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td>Envio da Nota Fiscal até: 22/{d['MesAtual']}/{d['AnoVigente']} – 18:00</td></tr>
-    <tr><td>Envio de documentos até: 22/{d['MesAtual']}/{d['AnoVigente']} – 18:00</td></tr>
-    <tr><td>Data de pagamento: {pagamento}</td></tr>
-  </tbody>
-</table>
 
-<br>
-<p>Reforçamos a importância de que o envio da Nota Fiscal e dos demais documentos siga
-rigorosamente o cronograma estabelecido acima.</p>
+# ---------------------------------------------------------------------------
+# Idempotency check
+# ---------------------------------------------------------------------------
 
-<p>Conforme disposto na cláusula <strong>2.7</strong> do contrato, destacamos que:</p>
+def already_sent_emails(mes_ref: str) -> set[str]:
+    """Return set of emails that were successfully sent for the given mes_ref."""
+    if not LOG_PATH.exists():
+        return set()
+    sent = set()
+    with open(LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("mes_ref") == mes_ref and entry.get("status") == "ok":
+                    sent.add(entry["recipient_email"])
+            except json.JSONDecodeError:
+                continue
+    return sent
 
-<blockquote style="border-left:3px solid #ccc;margin:0 0 0 16px;padding:8px 16px;
-                   color:#555;font-style:italic;">
-  Ocorrendo atraso, pela CONTRATADA, na entrega da fatura e respectiva Nota Fiscal nos termos
-  do item "h" do Preâmbulo, caso a emissão da nota fiscal ocorra a partir do dia 21 do mês da
-  prestação de serviço, a data de pagamento será dia 20 do mês subsequente à prestação de serviço.
-</blockquote>
 
-<br>
-<p>Portanto, o não cumprimento dos prazos acarretará o replanejamento da data de pagamento
-conforme previsto contratualmente.</p>
+# ---------------------------------------------------------------------------
+# Email template & rendering
+# ---------------------------------------------------------------------------
 
-<p>Atenciosamente,</p>
+def load_template() -> str:
+    if not TEMPLATE_PATH.exists():
+        print(f"[ERRO] Template de email não encontrado: {TEMPLATE_PATH}")
+        sys.exit(1)
+    return TEMPLATE_PATH.read_text(encoding="utf-8")
 
-</body>
-</html>"""
+
+def render_html(template: str, recipient: dict, dates: dict) -> str:
+    variables = {**dates, "ValorNF": recipient["ValorNF"]}
+    body = template
+    for key, value in variables.items():
+        body = body.replace("{{" + key + "}}", value)
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +294,102 @@ def send_with_retry(
 
 
 # ---------------------------------------------------------------------------
+# Summary notification email
+# ---------------------------------------------------------------------------
+
+def send_summary_notification(
+    token: str,
+    to_email: str,
+    subject_ref: str,
+    results: list[dict],
+    mes_ref: str,
+    sender: str,
+) -> None:
+    ok      = [r for r in results if r["status"] == "ok"]
+    failed  = [r for r in results if r["status"] == "error"]
+    skipped = [r for r in results if r["status"] == "skipped"]
+
+    rows_ok = "".join(
+        f"<tr><td style='padding:6px 10px;border:1px solid #ddd;'>✅</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;'>{r['recipient']['Nome']}</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;'>{r['recipient']['Email']}</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;'></td></tr>"
+        for r in ok
+    )
+    rows_failed = "".join(
+        f"<tr><td style='padding:6px 10px;border:1px solid #ddd;color:#c00;'>❌</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;'>{r['recipient']['Nome']}</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;'>{r['recipient']['Email']}</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;color:#c00;font-size:12px;'>{r['error']}</td></tr>"
+        for r in failed
+    )
+    rows_skipped = "".join(
+        f"<tr><td style='padding:6px 10px;border:1px solid #ddd;color:#888;'>⏭️</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;color:#888;'>{r['recipient']['Nome']}</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;color:#888;'>{r['recipient']['Email']}</td>"
+        f"<td style='padding:6px 10px;border:1px solid #ddd;color:#888;'>Já enviado anteriormente</td></tr>"
+        for r in skipped
+    )
+
+    status_geral = "✅ Concluído com sucesso" if not failed else f"⚠️ Concluído com {len(failed)} falha(s)"
+    timestamp    = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    html = f"""<!DOCTYPE html><html lang="pt-BR">
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:720px;">
+<h2 style="color:#2c5f8a;">Relatório de Envio — {mes_ref}</h2>
+<p><strong>Status:</strong> {status_geral}<br>
+   <strong>Executado em:</strong> {timestamp}<br>
+   <strong>Remetente:</strong> {sender}<br>
+   <strong>Assunto enviado:</strong> {subject_ref}</p>
+
+<table style="width:100%;border-collapse:collapse;margin-top:16px;">
+  <thead>
+    <tr style="background:#f0f0f0;">
+      <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;width:40px;"></th>
+      <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Nome</th>
+      <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Email</th>
+      <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Obs.</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows_ok}{rows_failed}{rows_skipped}
+  </tbody>
+</table>
+
+<p style="margin-top:24px;font-size:12px;color:#888;">
+  Enviado automaticamente por <em>send_cronograma.py</em>.
+</p>
+</body></html>"""
+
+    payload = {
+        "message": {
+            "subject": f"[Relatório] Envio de Cronograma — {mes_ref}",
+            "body": {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": to_email}}],
+        },
+        "saveToSentItems": True,
+    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(
+        "https://graph.microsoft.com/v1.0/me/sendMail",
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
 # Preview & UX
 # ---------------------------------------------------------------------------
 
-def print_preview(recipients: list[dict], dates: dict, subject: str, cc_list: list[str]) -> None:
+def print_preview(
+    recipients: list[dict],
+    dates: dict,
+    subject: str,
+    cc_list: list[str],
+    already_sent: set[str],
+) -> None:
     sep = "=" * 72
     print(f"\n{sep}")
     print("  PREVIEW — EMAILS A SEREM ENVIADOS")
@@ -286,12 +399,16 @@ def print_preview(recipients: list[dict], dates: dict, subject: str, cc_list: li
     print(f"  Pagamento  : {dates['QuintoDiaUtil']}/{dates['MesSeguinte']}/{dates['AnoMesSeguinte']}")
     if cc_list:
         print(f"  CC (todos) : {', '.join(cc_list)}")
-    print(f"\n  {'#':<4} {'Nome':<26} {'Email':<36} {'Valor NF'}")
+    print(f"\n  {'#':<4} {'S':<3} {'Nome':<24} {'Email':<34} {'Valor NF'}")
     print("  " + "-" * 72)
     for i, r in enumerate(recipients, 1):
-        print(f"  {i:<4} {r['Nome']:<26} {r['Email']:<36} {r['ValorNF']}")
+        flag = "[já enviado]" if r["Email"] in already_sent else ""
+        mark = "⏭" if flag else "→"
+        print(f"  {i:<4} {mark:<3} {r['Nome']:<24} {r['Email']:<34} {r['ValorNF']} {flag}")
     print(sep)
-    print(f"\n  Total: {len(recipients)} email(s)\n")
+    new_count = sum(1 for r in recipients if r["Email"] not in already_sent)
+    skip_count = len(recipients) - new_count
+    print(f"\n  Total: {len(recipients)} destinatário(s)  |  A enviar: {new_count}  |  Já enviados (pulados): {skip_count}\n")
 
 
 def ask_subject(dates: dict) -> str:
@@ -329,14 +446,21 @@ def main() -> None:
                         help="Ano de referência (padrão: ano atual)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Exibe preview sem autenticar nem enviar emails")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignora checagem de idempotência e reenvia mesmo emails já enviados")
     args = parser.parse_args()
 
-    config = load_config()
+    config   = load_config()
     cc_list: list[str] = config.get("cc_emails", [])
+    notif_to: str      = config.get("notification_email", "")
 
-    today = date.today()
+    today    = date.today()
     ref_date = date(args.ano or today.year, args.mes or today.month, 1)
-    dates = compute_dates(ref_date)
+    dates    = compute_dates(ref_date)
+    mes_ref  = f"{dates['MesAtual']}/{dates['AnoVigente']}"
+
+    # --- Carregar template ---
+    template = load_template()
 
     # --- Ler CSV ---
     print(f"\nLendo arquivo CSV: {args.csv}")
@@ -347,16 +471,33 @@ def main() -> None:
         sys.exit(1)
     print(f"  {len(recipients)} destinatário(s) encontrado(s).")
 
+    # --- Validar MX (skip em dry-run para agilizar) ---
+    mx_invalid: list[dict] = []
+    if not args.dry_run:
+        mx_invalid = validate_mx(recipients)
+
+    # --- Idempotência ---
+    sent_before: set[str] = set() if args.force else already_sent_emails(mes_ref)
+    if sent_before and not args.force:
+        print(f"\n  [Idempotência] {len(sent_before)} email(s) já enviado(s) este mês serão pulados.")
+        print("                 Use --force para reenviar mesmo assim.")
+
     # --- Assunto ---
     subject = args.assunto or ask_subject(dates)
 
     # --- Preview ---
-    print_preview(recipients, dates, subject, cc_list)
+    print_preview(recipients, dates, subject, cc_list, sent_before)
 
     if args.dry_run:
+        if mx_invalid:
+            print(f"  [DRY-RUN] {len(mx_invalid)} domínio(s) sem registro MX detectado(s) — verifique acima.")
         print("  [DRY-RUN] Nenhum email foi enviado. Remova --dry-run para enviar.")
         print("=" * 72)
         sys.exit(0)
+
+    # --- Avisar sobre domínios inválidos antes de confirmar ---
+    if mx_invalid:
+        print(f"  [AVISO] {len(mx_invalid)} email(s) com domínio sem MX. Eles serão tentados mesmo assim.")
 
     if not confirm_send():
         print("Envio cancelado.")
@@ -365,7 +506,7 @@ def main() -> None:
     # --- Autenticar ---
     print("\nAutenticando com Microsoft Graph API...")
     try:
-        token = get_access_token(config)
+        token  = get_access_token(config)
         sender = get_sender_email(token)
         print(f"  Remetente: {sender}\n")
     except Exception as exc:
@@ -373,39 +514,51 @@ def main() -> None:
         sys.exit(1)
 
     # --- Enviar ---
-    print(f"Enviando {len(recipients)} email(s)...")
+    print(f"Enviando emails para {mes_ref}...")
     results = []
+
     for i, recipient in enumerate(recipients, 1):
         label = f"[{i}/{len(recipients)}] {recipient['Nome']} <{recipient['Email']}>"
+
+        # Idempotência: pular já enviados
+        if recipient["Email"] in sent_before:
+            print(f"  {label} ... PULADO (já enviado)")
+            results.append({"recipient": recipient, "status": "skipped", "error": None})
+            continue
+
         print(f"  {label} ... ", end="", flush=True)
-        html_body = render_html(recipient, dates)
+        html_body = render_html(template, recipient, dates)
         status, error = "ok", None
+
         try:
             send_with_retry(token, recipient["Email"], cc_list, subject, html_body)
             print("OK")
         except Exception as exc:
-            error = str(exc)
+            error  = str(exc)
             status = "error"
-            print(f"FALHOU")
+            print("FALHOU")
             print(f"    Erro: {error}")
 
         results.append({"recipient": recipient, "status": status, "error": error})
-        append_log({
-            "timestamp": datetime.now().isoformat(),
-            "subject": subject,
-            "mes_ref": f"{dates['MesAtual']}/{dates['AnoVigente']}",
-            "sender": sender,
-            "recipient_name": recipient["Nome"],
-            "recipient_email": recipient["Email"],
-            "status": status,
-            "error": error,
-        })
+        if status != "skipped":
+            append_log({
+                "timestamp":       datetime.now().isoformat(),
+                "subject":         subject,
+                "mes_ref":         mes_ref,
+                "sender":          sender,
+                "recipient_name":  recipient["Nome"],
+                "recipient_email": recipient["Email"],
+                "status":          status,
+                "error":           error,
+            })
 
     # --- Resumo ---
-    ok = sum(1 for r in results if r["status"] == "ok")
-    failed = len(results) - ok
+    ok      = sum(1 for r in results if r["status"] == "ok")
+    failed  = sum(1 for r in results if r["status"] == "error")
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+
     print(f"\n{'=' * 72}")
-    print(f"  RESULTADO: {ok} enviado(s) com sucesso, {failed} falha(s)")
+    print(f"  RESULTADO: {ok} enviado(s) | {failed} falha(s) | {skipped} pulado(s)")
     if failed:
         print("\n  Falhas:")
         for r in results:
@@ -413,6 +566,15 @@ def main() -> None:
                 print(f"    - {r['recipient']['Nome']} <{r['recipient']['Email']}>: {r['error']}")
     print(f"\n  Log salvo em: {LOG_PATH}")
     print("=" * 72)
+
+    # --- Notificação pós-envio ---
+    if notif_to and ok + failed > 0:
+        print(f"\nEnviando relatório para {notif_to} ... ", end="", flush=True)
+        try:
+            send_summary_notification(token, notif_to, subject, results, mes_ref, sender)
+            print("OK")
+        except Exception as exc:
+            print(f"FALHOU ({exc})")
 
 
 if __name__ == "__main__":

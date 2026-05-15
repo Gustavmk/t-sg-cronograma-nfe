@@ -6,5 +6,7 @@
 
   "cc_emails": [
     "financeiro@empresa.com"
-  ]
+  ],
+
+  "notification_email": "financeiro@empresa.com"
 }
