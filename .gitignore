@@ -1,0 +1,7 @@
+config.json
+.token_cache.bin
+send_log.jsonl
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,10 @@
+{
+  "_comment": "Copie este arquivo para config.json e preencha os valores",
+
+  "tenant_id": "SEU_TENANT_ID_AQUI",
+  "client_id": "SEU_CLIENT_ID_AQUI",
+
+  "cc_emails": [
+    "financeiro@empresa.com"
+  ]
+}
