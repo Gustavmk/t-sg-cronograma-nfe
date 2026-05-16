@@ -6,10 +6,25 @@ Script Python para envio automático de cronograma de pagamento de Nota Fiscal v
 
 ## Pré-requisitos
 
+### Antes de iniciar
+
+```powershell
+winget install Microsoft.VisualStudioCode
+winget install --id Git.Git -e --source winget
+winget install -e --id Python.Python.3.12
+winget install GnuWin32.Make
+
+# Após instalar os requisitos para clone do repositório, execute em um novo terminal e encerre o antigo
+git clone https://github.com/Gustavmk/t-sg-cronograma-nfe
+```
+
 ### 1. Python 3.12+
 
 ```bash
 python --version
+python -m venv .venv
+.venv\Scripts\activate
+
 ```
 
 ### 2. Instalar dependências
@@ -28,6 +43,26 @@ pip install -r requirements.txt
 6. No menu lateral: **Permissões de API** → **Adicionar permissão** → **Microsoft Graph** → **Permissões delegadas**
    - Adicionar: `Mail.Send` e `User.Read`
 7. Clique em **Conceder consentimento do administrador**
+
+10. Libere isFallBackPublicClient
+
+Utilizando azure shell: 
+```bash
+ID='<Valor do ApplicationID>'
+az ad app show \
+  --id $ID \
+  --query id -o tsv
+
+# Libere a propriedade
+az ad app update \
+  --id $ID \
+  --set isFallbackPublicClient=true
+
+# Valide se está ativo
+az ad app show \
+  --id $ID \
+  --query isFallbackPublicClient
+```
 
 ### 4. Configurar o script
 
@@ -144,32 +179,6 @@ Antes de enviar, o script resolve o registro DNS MX de cada domínio de email. D
 | `send_log.jsonl` | Log de todos os envios com status e timestamp |
 
 ---
-
-## Automação com Makefile
-
-### Windows — instalar Make
-
-```powershell
-winget install GnuWin32.Make
-```
-
-### Comandos
-
-```bash
-make setup                        # Etapa 1: instala dependências e cria venv
-make dryrun CSV=destinatarios.csv # Etapa 2: preview sem enviar
-make run    CSV=destinatarios.csv # Etapa 3: envio real com confirmação
-```
-
-### Parâmetros opcionais do Make
-
-```bash
-make run CSV=lista.csv MES=5 ANO=2026
-make run CSV=lista.csv ASSUNTO="Cronograma Maio/2026"
-```
-
----
-
 ## Segurança
 
 - **Não commitar** `config.json` nem `.token_cache.bin` — já incluídos no `.gitignore`
